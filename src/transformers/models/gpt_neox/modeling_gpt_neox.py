@@ -5,6 +5,7 @@
 #                          modular_gpt_neox.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -33,6 +34,42 @@ from .configuration_gpt_neox import GPTNeoXConfig
 
 
 logger = logging.get_logger(__name__)
+
+
+@auto_docstring(
+    custom_intro="""
+    Base class for GPTNeoX model outputs, with optional post-RoPE key embeddings.
+    """
+)
+@dataclass
+class GPTNeoXModelOutputWithPast(BaseModelOutputWithPast):
+    r"""
+    post_rope_key_embeddings (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*, returned when `output_post_rope_key_embeddings=True` is passed):
+        Post-RoPE key embeddings from the first attention layer, reshaped to match the hidden size. These are the key
+        projections after rotary position embedding is applied and before the attention matmul.
+    """
+
+    post_rope_key_embeddings: torch.FloatTensor | None = None
+
+
+@auto_docstring(
+    custom_intro="""
+    Base class for GPTNeoX causal language model outputs, with optional post-RoPE key embeddings.
+    """
+)
+@dataclass
+class GPTNeoXCausalLMOutputWithPast(CausalLMOutputWithPast):
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss (for next-token prediction).
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+    post_rope_key_embeddings (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*, returned when `output_post_rope_key_embeddings=True` is passed):
+        Post-RoPE key embeddings from the first attention layer, reshaped to match the hidden size. These are the key
+        projections after rotary position embedding is applied and before the attention matmul.
+    """
+
+    post_rope_key_embeddings: torch.FloatTensor | None = None
 
 
 class GPTNeoXMLP(nn.Module):
@@ -217,6 +254,12 @@ class GPTNeoXAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        post_rope_key_embeddings_out = kwargs.pop("_post_rope_key_embeddings", None)
+        if post_rope_key_embeddings_out is not None and self.layer_idx == 0:
+            post_rope_key_embeddings_out.append(
+                key_states.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+            )
+
         # Cache QKV values
         if layer_past is not None:
             key_states, value_states = layer_past.update(key_states, value_states, self.layer_idx)
@@ -327,7 +370,12 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
 
     @merge_with_config_defaults
     @capture_outputs
-    @auto_docstring
+    @auto_docstring(
+        custom_args="""
+        output_post_rope_key_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether or not to return the post-RoPE key embeddings from the first attention layer.
+        """
+    )
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -336,8 +384,9 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         past_key_values: Cache | None = None,
         use_cache: bool | None = None,
+        output_post_rope_key_embeddings: bool | None = False,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
+    ) -> GPTNeoXModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -362,7 +411,12 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
 
         hidden_states = self.emb_dropout(inputs_embeds)
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
-        for layer in self.layers:
+        post_rope_key_embeddings = None
+        post_rope_key_embeddings_out = [] if output_post_rope_key_embeddings else None
+        for layer_idx, layer in enumerate(self.layers):
+            layer_kwargs = kwargs
+            if layer_idx == 0 and post_rope_key_embeddings_out is not None:
+                layer_kwargs = {**kwargs, "_post_rope_key_embeddings": post_rope_key_embeddings_out}
             hidden_states = layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -370,14 +424,18 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
                 layer_past=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
-                **kwargs,
+                **layer_kwargs,
             )
+
+        if post_rope_key_embeddings_out is not None and len(post_rope_key_embeddings_out) > 0:
+            post_rope_key_embeddings = post_rope_key_embeddings_out[0]
 
         hidden_states = self.final_layer_norm(hidden_states)
 
-        return BaseModelOutputWithPast(
+        return GPTNeoXModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            post_rope_key_embeddings=post_rope_key_embeddings,
         )
 
     def get_input_embeddings(self):
@@ -413,7 +471,12 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
         self.embed_out = new_embeddings
 
     @can_return_tuple
-    @auto_docstring
+    @auto_docstring(
+        custom_args="""
+        output_post_rope_key_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether or not to return the post-RoPE key embeddings from the first attention layer.
+        """
+    )
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -424,8 +487,9 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        output_post_rope_key_embeddings: bool | None = False,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | CausalLMOutputWithPast:
+    ) -> tuple | GPTNeoXCausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the left-to-right language modeling loss (next word prediction). Indices should be in
@@ -449,13 +513,14 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
         >>> prediction_logits = outputs.logits
         ```"""
 
-        outputs: BaseModelOutputWithPast = self.gpt_neox(
+        outputs: GPTNeoXModelOutputWithPast = self.gpt_neox(
             input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            output_post_rope_key_embeddings=output_post_rope_key_embeddings,
             **kwargs,
         )
 
@@ -467,12 +532,13 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        return GPTNeoXCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            post_rope_key_embeddings=outputs.post_rope_key_embeddings,
         )
 
 
@@ -676,11 +742,13 @@ class GPTNeoXForQuestionAnswering(GPTNeoXPreTrainedModel):
 
 
 __all__ = [
+    "GPTNeoXCausalLMOutputWithPast",
     "GPTNeoXForCausalLM",
     "GPTNeoXForQuestionAnswering",
     "GPTNeoXForSequenceClassification",
     "GPTNeoXForTokenClassification",
     "GPTNeoXLayer",
     "GPTNeoXModel",
+    "GPTNeoXModelOutputWithPast",
     "GPTNeoXPreTrainedModel",
 ]
