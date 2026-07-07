@@ -23,7 +23,12 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
-from ..llama.modeling_llama import LlamaModel, LlamaPreTrainedModel, LlamaRotaryEmbedding, rotate_half
+from ..llama.modeling_llama import (
+    LlamaModel,
+    LlamaPreTrainedModel,
+    LlamaRotaryEmbedding,
+    rotate_half,
+)
 from .configuration_gpt_neox import GPTNeoXConfig
 
 
@@ -41,9 +46,14 @@ class GPTNeoXModelOutputWithPast(BaseModelOutputWithPast):
     post_rope_key_embeddings (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*, returned when `output_post_rope_key_embeddings=True` is passed):
         Post-RoPE key embeddings from the first attention layer, reshaped to match the hidden size. These are the key
         projections after rotary position embedding is applied and before the attention matmul.
+    post_rope_key_embeddings_layers (`tuple(torch.FloatTensor)`, *optional*, returned when `output_post_rope_key_embeddings_layers=True` is passed):
+        Tuple of `torch.FloatTensor` (one for each attention layer) of shape `(batch_size, sequence_length,
+        hidden_size)`. These are the key projections after rotary position embedding is applied and before the
+        attention matmul, collected at every layer.
     """
 
     post_rope_key_embeddings: torch.FloatTensor | None = None
+    post_rope_key_embeddings_layers: tuple[torch.FloatTensor, ...] | None = None
 
 
 @auto_docstring(
@@ -61,9 +71,14 @@ class GPTNeoXCausalLMOutputWithPast(CausalLMOutputWithPast):
     post_rope_key_embeddings (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*, returned when `output_post_rope_key_embeddings=True` is passed):
         Post-RoPE key embeddings from the first attention layer, reshaped to match the hidden size. These are the key
         projections after rotary position embedding is applied and before the attention matmul.
+    post_rope_key_embeddings_layers (`tuple(torch.FloatTensor)`, *optional*, returned when `output_post_rope_key_embeddings_layers=True` is passed):
+        Tuple of `torch.FloatTensor` (one for each attention layer) of shape `(batch_size, sequence_length,
+        hidden_size)`. These are the key projections after rotary position embedding is applied and before the
+        attention matmul, collected at every layer.
     """
 
     post_rope_key_embeddings: torch.FloatTensor | None = None
+    post_rope_key_embeddings_layers: tuple[torch.FloatTensor, ...] | None = None
 
 
 class GPTNeoXMLP(nn.Module):
@@ -102,14 +117,23 @@ class GPTNeoXRotaryEmbedding(LlamaRotaryEmbedding):
         """
         base = config.rope_parameters["rope_theta"]
         partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        head_dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
+        )
         dim = int(head_dim * partial_rotary_factor)
 
         attention_factor = 1.0  # Unused in this type of RoPE
 
         # Compute the inverse frequencies
         inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+            base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.int64).to(
+                    device=device, dtype=torch.float
+                )
+                / dim
+            )
         )
         return inv_freq, attention_factor
 
@@ -165,9 +189,13 @@ def eager_attention_forward(
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query.dtype
+    )
 
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_weights = nn.functional.dropout(
+        attn_weights, p=dropout, training=module.training
+    )
     attn_output = torch.matmul(attn_weights, value)
 
     # Reshape outputs
@@ -188,8 +216,12 @@ class GPTNeoXAttention(nn.Module):
         self.is_causal = True
         self.layer_idx = layer_idx
 
-        self.query_key_value = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=config.attention_bias)
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
+        self.query_key_value = nn.Linear(
+            config.hidden_size, 3 * config.hidden_size, bias=config.attention_bias
+        )
+        self.dense = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.attention_bias
+        )
 
     def forward(
         self,
@@ -206,17 +238,31 @@ class GPTNeoXAttention(nn.Module):
         query_states, key_states, value_states = qkv.chunk(3, dim=-1)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
 
         post_rope_key_embeddings_out = kwargs.pop("_post_rope_key_embeddings", None)
-        if post_rope_key_embeddings_out is not None and self.layer_idx == 0:
-            post_rope_key_embeddings_out.append(
+        post_rope_key_embeddings_layers_out = kwargs.pop(
+            "_post_rope_key_embeddings_layers", None
+        )
+        capture_first_layer = (
+            post_rope_key_embeddings_out is not None and self.layer_idx == 0
+        )
+        if capture_first_layer or post_rope_key_embeddings_layers_out is not None:
+            reshaped_key_states = (
                 key_states.transpose(1, 2).reshape(*input_shape, -1).contiguous()
             )
+            if capture_first_layer:
+                post_rope_key_embeddings_out.append(reshaped_key_states)
+            if post_rope_key_embeddings_layers_out is not None:
+                post_rope_key_embeddings_layers_out.append(reshaped_key_states)
 
         # Cache QKV values
         if layer_past is not None:
-            key_states, value_states = layer_past.update(key_states, value_states, self.layer_idx)
+            key_states, value_states = layer_past.update(
+                key_states, value_states, self.layer_idx
+            )
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -246,7 +292,9 @@ class GPTNeoXLayer(GradientCheckpointingLayer):
         super().__init__()
         self.use_parallel_residual = config.use_parallel_residual
         self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.post_attention_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
         self.post_attention_dropout = nn.Dropout(config.hidden_dropout)
         self.post_mlp_dropout = nn.Dropout(config.hidden_dropout)
         self.attention = GPTNeoXAttention(config, layer_idx)
@@ -307,8 +355,12 @@ class GPTNeoXModel(LlamaModel):
 
         self.embed_in = nn.Embedding(config.vocab_size, config.hidden_size)
         self.emb_dropout = nn.Dropout(config.hidden_dropout)
-        self.layers = nn.ModuleList([GPTNeoXLayer(config, i) for i in range(config.num_hidden_layers)])
-        self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layers = nn.ModuleList(
+            [GPTNeoXLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
+        self.final_layer_norm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
         self.rotary_emb = GPTNeoXRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -327,6 +379,8 @@ class GPTNeoXModel(LlamaModel):
         custom_args="""
         output_post_rope_key_embeddings (`bool`, *optional*, defaults to `False`):
             Whether or not to return the post-RoPE key embeddings from the first attention layer.
+        output_post_rope_key_embeddings_layers (`bool`, *optional*, defaults to `False`):
+            Whether or not to return the post-RoPE key embeddings from every attention layer.
         """
     )
     def forward(
@@ -338,6 +392,7 @@ class GPTNeoXModel(LlamaModel):
         past_key_values: Cache | None = None,
         use_cache: bool | None = None,
         output_post_rope_key_embeddings: bool | None = False,
+        output_post_rope_key_embeddings_layers: bool | None = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> GPTNeoXModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -350,8 +405,13 @@ class GPTNeoXModel(LlamaModel):
             past_key_values = DynamicCache(config=self.config)
 
         if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
+            )
+            position_ids = (
+                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+                + past_seen_tokens
+            )
             position_ids = position_ids.unsqueeze(0)
 
         causal_mask = create_causal_mask(
@@ -365,11 +425,22 @@ class GPTNeoXModel(LlamaModel):
         hidden_states = self.emb_dropout(inputs_embeds)
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
         post_rope_key_embeddings = None
+        post_rope_key_embeddings_layers = None
         post_rope_key_embeddings_out = [] if output_post_rope_key_embeddings else None
+        post_rope_key_embeddings_layers_out = (
+            [] if output_post_rope_key_embeddings_layers else None
+        )
         for layer_idx, layer in enumerate(self.layers):
             layer_kwargs = kwargs
+            extra_kwargs = {}
             if layer_idx == 0 and post_rope_key_embeddings_out is not None:
-                layer_kwargs = {**kwargs, "_post_rope_key_embeddings": post_rope_key_embeddings_out}
+                extra_kwargs["_post_rope_key_embeddings"] = post_rope_key_embeddings_out
+            if post_rope_key_embeddings_layers_out is not None:
+                extra_kwargs["_post_rope_key_embeddings_layers"] = (
+                    post_rope_key_embeddings_layers_out
+                )
+            if extra_kwargs:
+                layer_kwargs = {**kwargs, **extra_kwargs}
             hidden_states = layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -380,8 +451,13 @@ class GPTNeoXModel(LlamaModel):
                 **layer_kwargs,
             )
 
-        if post_rope_key_embeddings_out is not None and len(post_rope_key_embeddings_out) > 0:
+        if (
+            post_rope_key_embeddings_out is not None
+            and len(post_rope_key_embeddings_out) > 0
+        ):
             post_rope_key_embeddings = post_rope_key_embeddings_out[0]
+        if post_rope_key_embeddings_layers_out is not None:
+            post_rope_key_embeddings_layers = tuple(post_rope_key_embeddings_layers_out)
 
         hidden_states = self.final_layer_norm(hidden_states)
 
@@ -389,6 +465,7 @@ class GPTNeoXModel(LlamaModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             post_rope_key_embeddings=post_rope_key_embeddings,
+            post_rope_key_embeddings_layers=post_rope_key_embeddings_layers,
         )
 
 
@@ -422,6 +499,8 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
         custom_args="""
         output_post_rope_key_embeddings (`bool`, *optional*, defaults to `False`):
             Whether or not to return the post-RoPE key embeddings from the first attention layer.
+        output_post_rope_key_embeddings_layers (`bool`, *optional*, defaults to `False`):
+            Whether or not to return the post-RoPE key embeddings from every attention layer.
         """
     )
     def forward(
@@ -435,6 +514,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_post_rope_key_embeddings: bool | None = False,
+        output_post_rope_key_embeddings_layers: bool | None = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | GPTNeoXCausalLMOutputWithPast:
         r"""
@@ -468,16 +548,23 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_post_rope_key_embeddings=output_post_rope_key_embeddings,
+            output_post_rope_key_embeddings_layers=output_post_rope_key_embeddings_layers,
             **kwargs,
         )
 
         hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
         logits = self.embed_out(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+            )
 
         return GPTNeoXCausalLMOutputWithPast(
             loss=loss,
@@ -486,6 +573,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             post_rope_key_embeddings=outputs.post_rope_key_embeddings,
+            post_rope_key_embeddings_layers=outputs.post_rope_key_embeddings_layers,
         )
 
 
@@ -547,13 +635,19 @@ class GPTNeoXForSequenceClassification(GPTNeoXPreTrainedModel):
 
         batch_size = logits.shape[0]
         if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+            raise ValueError(
+                "Cannot handle batch sizes > 1 if no padding token is defined."
+            )
         if self.config.pad_token_id is None:
             last_non_pad_token = -1
         elif input_ids is not None:
             # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
-            non_pad_mask = (input_ids != self.config.pad_token_id).to(logits.device, torch.int32)
-            token_indices = torch.arange(input_ids.shape[-1], device=logits.device, dtype=torch.int32)
+            non_pad_mask = (input_ids != self.config.pad_token_id).to(
+                logits.device, torch.int32
+            )
+            token_indices = torch.arange(
+                input_ids.shape[-1], device=logits.device, dtype=torch.int32
+            )
             last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
         else:
             last_non_pad_token = -1
@@ -562,11 +656,18 @@ class GPTNeoXForSequenceClassification(GPTNeoXPreTrainedModel):
                 "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
             )
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token]
+        pooled_logits = logits[
+            torch.arange(batch_size, device=logits.device), last_non_pad_token
+        ]
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, pooled_logits=pooled_logits, config=self.config)
+            loss = self.loss_function(
+                logits=logits,
+                labels=labels,
+                pooled_logits=pooled_logits,
+                config=self.config,
+            )
 
         return SequenceClassifierOutputWithPast(
             loss=loss,
@@ -677,7 +778,9 @@ class GPTNeoXForQuestionAnswering(GPTNeoXPreTrainedModel):
 
         loss = None
         if start_positions is not None and end_positions is not None:
-            loss = self.loss_function(start_logits, end_logits, start_positions, end_positions)
+            loss = self.loss_function(
+                start_logits, end_logits, start_positions, end_positions
+            )
 
         return QuestionAnsweringModelOutput(
             loss=loss,
